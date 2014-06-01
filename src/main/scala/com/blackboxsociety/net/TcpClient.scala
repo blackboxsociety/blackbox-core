@@ -5,16 +5,16 @@ import scalaz.syntax.bind._
 import com.blackboxsociety._
 import scalaz.concurrent._
 import scalaz.concurrent.Task._
-import scalaz.syntax.id._
+import scalaz.stream._
+import scalaz.stream.{async => streamAsync}
 import java.nio.channels._
 import java.nio._
-import java.nio.charset.Charset
 import com.blackboxsociety.util._
 import java.io.IOException
+import scodec.bits.ByteVector
 
 trait TcpClient {
-  def read(): Task[Finishable[ByteBuffer]]
-  def readAsString(): Task[Finishable[String]]
+  def reader(): Task[Finishable[ByteBuffer]]
   def write(b: Array[Byte]): Task[Unit]
   def write(s: String): Task[Unit]
   def write(c: FileChannel, o: Long = 0): Task[Unit]
@@ -34,18 +34,31 @@ object TcpClient {
 
   private case class TcpClientImpl(s: SocketChannel) extends TcpClient {
 
-    def read(): Task[Finishable[ByteBuffer]] = async { next =>
-      EventLoop.addSocketRead(s, { () =>
-        val buffer = ByteBuffer.allocate(8192)
-        s.read(buffer) match {
-          case -1 => next(Done(buffer).right)
-          case _  => next(More(buffer).right)
-        }
-      })
+    def reader(): Process[Task, ByteVector] = {
+      val (q, src) = streamAsync.queue[ByteVector]
+      def reader(): Unit = {
+        EventLoop.addSocketRead(s, { () =>
+          val buffer = ByteBuffer.allocate(32768)
+          try {
+            s.read(buffer) match {
+              case -1 => q.enqueue(ByteVector.view(buffer)); q.close
+              case _ => q.enqueue(ByteVector.view(buffer)); reader()
+            }
+          } catch {
+            case e: IOException => q.fail(e)
+          }
+        })
+      }
+      reader()
+      src
     }
 
-    def readAsString(): Task[Finishable[String]] = read map { n =>
-      n map { b => new String(b.array(), Charset.forName("UTF-8")) }
+    def readAsString(): Process[Task, String] = reader().pipe(text.utf8Decode)
+
+    def writer(): Sink[Task, ByteVector] = {
+      val (q, src) = streamAsync.queue[ByteVector]
+      src.flatMap({ b => Process.eval(write(b.toByteBuffer)) }).runLog.runAsync({ _ => Unit})
+      streamAsync.toSink(q, {_ => close()})
     }
 
     def write(b: Array[Byte]): Task[Unit] = async { next =>
