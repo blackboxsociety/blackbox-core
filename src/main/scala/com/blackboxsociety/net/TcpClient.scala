@@ -5,18 +5,20 @@ import scalaz.syntax.bind._
 import com.blackboxsociety._
 import scalaz.concurrent._
 import scalaz.concurrent.Task._
-import scalaz.stream._
-import scalaz.stream.{async => streamAsync}
+import scalaz.stream.{async => streamAsync, _}
 import java.nio.channels._
 import java.nio._
-import com.blackboxsociety.util._
 import java.io.IOException
 import scodec.bits.ByteVector
+import com.blackboxsociety.util._
 
 trait TcpClient {
-  def reader(): Task[Finishable[ByteBuffer]]
+  def reader(): Process[Task, ByteVector]
+  def stringReader(): Process[Task, String]
   def write(b: Array[Byte]): Task[Unit]
   def write(s: String): Task[Unit]
+  def write(b: ByteBuffer): Task[Unit]
+  def write(s: ByteVector): Task[Unit]
   def write(c: FileChannel, o: Long = 0): Task[Unit]
   def end(b: Array[Byte]): Task[Unit]
   def end(s: String): Task[Unit]
@@ -35,30 +37,35 @@ object TcpClient {
   private case class TcpClientImpl(s: SocketChannel) extends TcpClient {
 
     def reader(): Process[Task, ByteVector] = {
-      val (q, src) = streamAsync.queue[ByteVector]
-      def reader(): Unit = {
+      def read(): Task[Finishable[ByteVector]] = async { next =>
         EventLoop.addSocketRead(s, { () =>
           val buffer = ByteBuffer.allocate(32768)
           try {
             s.read(buffer) match {
-              case -1 => q.enqueue(ByteVector.view(buffer)); q.close
-              case _ => q.enqueue(ByteVector.view(buffer)); reader()
+              case -1 => next(\/-(Done(ByteVector.view(buffer))))
+              case _  => next(\/-(More(ByteVector.view(buffer))))
             }
           } catch {
-            case e: IOException => q.fail(e)
+            case e: IOException => next(-\/(e))
           }
         })
       }
-      reader()
-      src
+      def go(): Process[Task, ByteVector] =
+        Process.await[Task, Finishable[ByteVector], ByteVector](read()) {
+          case Done(b) => Process.emit(b)
+          case More(b) => Process.Emit(Seq(b), go())
+        }
+      go()
     }
 
-    def readAsString(): Process[Task, String] = reader().pipe(text.utf8Decode)
+    def stringReader(): Process[Task, String] = reader().pipe(text.utf8Decode)
 
     def writer(): Sink[Task, ByteVector] = {
-      val (q, src) = streamAsync.queue[ByteVector]
-      src.flatMap({ b => Process.eval(write(b.toByteBuffer)) }).runLog.runAsync({ _ => Unit})
-      streamAsync.toSink(q, {_ => close()})
+      def go(): Sink[Task, ByteVector] =
+        Process.await[Task, ByteVector => Task[Unit], ByteVector => Task[Unit]](Task.now(write _)) { f =>
+          Process.Emit(Seq(f), go())
+        }
+      go()
     }
 
     def write(b: Array[Byte]): Task[Unit] = async { next =>
@@ -68,6 +75,8 @@ object TcpClient {
       buffer.flip()
       write(buffer).runAsync(next)
     }
+
+    def write(b: ByteVector): Task[Unit] = write(b.toByteBuffer)
 
     def write(b: ByteBuffer): Task[Unit] = async { next =>
       EventLoop.addSocketWrite(s, { () =>
